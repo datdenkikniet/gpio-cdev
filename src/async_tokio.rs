@@ -8,50 +8,21 @@
 
 //! Wrapper for asynchronous programming using Tokio.
 
-use futures::ready;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use mio::{PollOpt, Ready, Token};
-use tokio::io::PollEvented;
+use futures::{pin_mut, ready};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, ReadBuf},
+};
 
-use std::io;
-use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
+use std::{mem, slice};
+
+use crate::ffi;
 
 use super::event_err;
 use super::{LineEvent, LineEventHandle, Result};
-
-struct PollWrapper {
-    handle: LineEventHandle,
-}
-
-impl Evented for PollWrapper {
-    fn register(
-        &self,
-        poll: &mio::Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.handle.file.as_raw_fd()).register(poll, token, interest, opts)
-    }
-
-    fn reregister(
-        &self,
-        poll: &mio::Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.handle.file.as_raw_fd()).reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        EventedFd(&self.handle.file.as_raw_fd()).deregister(poll)
-    }
-}
 
 /// Wrapper around a `LineEventHandle` which implements a `futures::stream::Stream` for interrupts.
 ///
@@ -88,7 +59,7 @@ impl Evented for PollWrapper {
 /// # }
 /// ```
 pub struct AsyncLineEventHandle {
-    evented: PollEvented<PollWrapper>,
+    file: File,
 }
 
 impl AsyncLineEventHandle {
@@ -98,16 +69,30 @@ impl AsyncLineEventHandle {
     ///
     /// * `handle` - handle to be wrapped.
     pub fn new(handle: LineEventHandle) -> Result<AsyncLineEventHandle> {
-        // The file descriptor needs to be configured for non-blocking I/O for PollEvented to work.
-        let fd = handle.file.as_raw_fd();
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
         Ok(AsyncLineEventHandle {
-            evented: PollEvented::new(PollWrapper { handle })?,
+            file: File::from_std(handle.file),
         })
+    }
+
+    pub(crate) fn read_event(
+        bytes_read: usize,
+        buffer: &mut [u8],
+    ) -> std::result::Result<Option<LineEvent>, nix::Error> {
+        let mut data: ffi::gpioevent_data = unsafe { mem::zeroed() };
+        let data_as_buf = unsafe {
+            slice::from_raw_parts_mut(
+                &mut data as *mut ffi::gpioevent_data as *mut u8,
+                mem::size_of::<ffi::gpioevent_data>(),
+            )
+        };
+
+        data_as_buf.copy_from_slice(&buffer[..bytes_read]);
+
+        if bytes_read != mem::size_of::<ffi::gpioevent_data>() {
+            Ok(None)
+        } else {
+            Ok(Some(LineEvent(data)))
+        }
     }
 }
 
@@ -115,27 +100,23 @@ impl Stream for AsyncLineEventHandle {
     type Item = Result<LineEvent>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let ready = Ready::readable();
-        if let Err(e) = ready!(self.evented.poll_read_ready(cx, ready)) {
+        let handle = Pin::into_inner(self);
+        let file = &mut handle.file;
+
+        pin_mut!(file);
+
+        let mut raw_buffer = [0u8; mem::size_of::<ffi::gpioevent_data>()];
+        let mut buffer = ReadBuf::new(&mut raw_buffer);
+        if let Err(e) = ready!(file.poll_read(cx, &mut buffer)) {
             return Poll::Ready(Some(Err(e.into())));
         }
-
-        match self.evented.get_ref().handle.read_event() {
+        match AsyncLineEventHandle::read_event(buffer.filled().len(), &mut raw_buffer) {
             Ok(Some(event)) => Poll::Ready(Some(Ok(event))),
             Ok(None) => Poll::Ready(Some(Err(event_err(nix::Error::Sys(
                 nix::errno::Errno::EIO,
             ))))),
-            Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => {
-                self.evented.clear_read_ready(cx, ready)?;
-                Poll::Pending
-            }
+            Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => Poll::Pending,
             Err(e) => Poll::Ready(Some(Err(event_err(e)))),
         }
-    }
-}
-
-impl AsRef<LineEventHandle> for AsyncLineEventHandle {
-    fn as_ref(&self) -> &LineEventHandle {
-        &self.evented.get_ref().handle
     }
 }

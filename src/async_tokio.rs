@@ -107,9 +107,24 @@ impl Stream for AsyncLineEventHandle {
 
         let mut raw_buffer = [0u8; mem::size_of::<ffi::gpioevent_data>()];
         let mut buffer = ReadBuf::new(&mut raw_buffer);
-        if let Err(e) = ready!(file.poll_read(cx, &mut buffer)) {
-            return Poll::Ready(Some(Err(e.into())));
+
+        let poll = file.poll_read(cx, &mut buffer);
+
+        match poll {
+            Poll::Ready(result) => {
+                if let Err(e) = result {
+                    println!("Got error.");
+                    return Poll::Ready(Some(Err(e.into())));
+                } else {
+                    println!("Ready to proceed");
+                }
+            }
+            Poll::Pending => {
+                println!("Pending");
+                return Poll::Pending;
+            }
         }
+
         match AsyncLineEventHandle::read_event(buffer.filled().len(), &mut raw_buffer) {
             Ok(Some(event)) => Poll::Ready(Some(Ok(event))),
             Ok(None) => Poll::Ready(Some(Err(event_err(nix::Error::Sys(

@@ -8,9 +8,9 @@
 
 //! Wrapper for asynchronous programming using Tokio.
 
+use futures::pin_mut;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
-use futures::{pin_mut, ready};
 use tokio::{
     fs::File,
     io::{AsyncRead, ReadBuf},
@@ -100,7 +100,7 @@ impl Stream for AsyncLineEventHandle {
     type Item = Result<LineEvent>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let handle = Pin::into_inner(self);
+        let handle = self.get_mut();
         let file = &mut handle.file;
 
         pin_mut!(file);
